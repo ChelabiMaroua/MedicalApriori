@@ -1,6 +1,9 @@
 from collections import defaultdict
 from itertools import combinations
 import numpy as np
+from scipy.sparse import lil_matrix
+import time
+
 
 class Apriori:
     def __init__(self, min_support=None, min_confidence=0.6):
@@ -10,267 +13,297 @@ class Apriori:
         self.frequent_itemsets = {}
         self.rules = []
         self.n_transactions = 0
-        
+        self.use_sparse = False
+        self.transaction_matrix = None
+        self.item_to_idx = {}
+        self.idx_to_item = {}
+        self.execution_time = 0
+        self.initial_support = None
+        self.support_history = []
+        self.iteration_stats = []
+
     def fit(self, transactions):
-        """Exécuter l'algorithme Apriori"""
+        """Exécuter l'algorithme Apriori avec adaptation automatique du support."""
+        start_time = time.time()
         self.transactions = transactions
         self.n_transactions = len(transactions)
-        
+
         if self.n_transactions == 0:
             raise ValueError("❌ Aucune transaction fournie")
-        
-        # Calcul automatique du support si non défini
+
+        # Calcul automatique du support initial
         if self.min_support is None:
             self.calculate_adaptive_support()
-        
+        self.initial_support = self.min_support
+
+        # Représentation matricielle (dense ou creuse)
+        self._prepare_matrix_representation()
+
         print(f"\n🔍 Démarrage Apriori")
-        print("="*70)
-        
+        print("=" * 70)
+        print(f"📊 Matrice utilisée : {'CREUSE' if self.use_sparse else 'DENSE'}")
+        print(f"🎯 Support initial : {self.initial_support:.4f}")
+
+        # ------------------------------
         # Étape 1 : itemsets de taille 1
+        # ------------------------------
         item_counts = defaultdict(int)
         for transaction in transactions:
             for item in transaction:
                 item_counts[frozenset([item])] += 1
-        
+
         frequent_1 = {
             itemset: count / self.n_transactions
             for itemset, count in item_counts.items()
             if (count / self.n_transactions) >= self.min_support
         }
-        
+
         if not frequent_1:
-            print("⚠️  Aucun itemset fréquent trouvé. Essayez de réduire min_support.")
+            print("⚠️ Aucun itemset fréquent trouvé. Essayez de réduire min_support.")
             return self
-        
+
         self.frequent_itemsets[1] = [
             {'itemset': list(itemset), 'support': sup}
             for itemset, sup in frequent_1.items()
         ]
-        
-        print(f"📊 Itération 1: {len(frequent_1)} itemsets fréquents trouvés")
-        
+
+        self.iteration_stats.append({
+            'iteration': 1,
+            'candidates': len(item_counts),
+            'frequent': len(frequent_1),
+            'support': self.min_support
+        })
+
+        print(f"📊 Itération 1 : {len(frequent_1)} itemsets fréquents trouvés")
+
+        # ------------------------------
         # Étapes suivantes
+        # ------------------------------
         k = 2
         current_frequent = frequent_1
+
         while current_frequent:
             candidates = self._generate_candidates(current_frequent, k)
             if not candidates:
                 break
-            
-            candidate_counts = defaultdict(int)
-            for transaction in self.transactions:
-                tset = set(transaction)
-                for candidate in candidates:
-                    if candidate.issubset(tset):
-                        candidate_counts[candidate] += 1
-            
-            # 🔥 On calcule tous les supports bruts à cette itération
-            all_supports = np.array([count / self.n_transactions for count in candidate_counts.values()])
-            
-            # 🔥 Recalcul du min_support dynamique selon la distribution actuelle
-            if len(all_supports) > 0:
-                mean_support = np.mean(all_supports)
-                std_support = np.std(all_supports)
-                
-                # On écarte les valeurs extrêmes (au-delà de 2 écarts-types)
-                filtered_supports = [s for s in all_supports if abs(s - mean_support) <= 2 * std_support]
-                
-                if len(filtered_supports) > 0:
-                    adjusted_mean = np.mean(filtered_supports)
-                else:
-                    adjusted_mean = mean_support
-                
-                # On ajuste le min_support avec un facteur de stabilité
-                prev_support = self.min_support
-                self.min_support = max(0.01, min(0.5, 0.5 * prev_support + 0.5 * adjusted_mean))
-                
-                print(f"⚙️  Support recalculé à l’itération {k}: moyenne={adjusted_mean:.4f}, σ={std_support:.4f} → min_support={self.min_support:.4f}")
-            
+
+            # Comptage des supports
+            if self.use_sparse:
+                candidate_counts = self._count_support_sparse(candidates)
+            else:
+                candidate_counts = defaultdict(int)
+                for transaction in self.transactions:
+                    tset = set(transaction)
+                    for candidate in candidates:
+                        if candidate.issubset(tset):
+                            candidate_counts[candidate] += 1
+
+            if not candidate_counts:
+                break
+
+            # ------------------------------
+            # Recalcul dynamique du support
+            # ------------------------------
+            all_supports = np.array([c / self.n_transactions for c in candidate_counts.values()])
+            mean_support = np.mean(all_supports)
+            std_support = np.std(all_supports)
+
+            # Filtrage des valeurs extrêmes
+            filtered = [s for s in all_supports if abs(s - mean_support) <= 2 * std_support]
+            adjusted_mean = np.mean(filtered) if len(filtered) > 0 else mean_support
+
+            prev_support = self.min_support
+            self.min_support = max(0.01, min(0.5, 0.5 * prev_support + 0.5 * adjusted_mean))
+
+            self.support_history.append({
+                'iteration': k,
+                'support': self.min_support,
+                'mean': adjusted_mean,
+                'std': std_support
+            })
+
+            print(f"⚙️  Itération {k} → recalcul du support : moyenne={adjusted_mean:.4f}, σ={std_support:.4f} → nouveau min_support={self.min_support:.4f}")
+
+            # ------------------------------
+            # Sélection des nouveaux itemsets fréquents
+            # ------------------------------
             new_frequent = {
                 itemset: count / self.n_transactions
                 for itemset, count in candidate_counts.items()
                 if (count / self.n_transactions) >= self.min_support
             }
-            
+
             if not new_frequent:
                 break
-            
+
             self.frequent_itemsets[k] = [
                 {'itemset': list(itemset), 'support': sup}
                 for itemset, sup in new_frequent.items()
             ]
-            
-            print(f"📊 Itération {k}: {len(new_frequent)} itemsets fréquents trouvés")
+
+            self.iteration_stats.append({
+                'iteration': k,
+                'candidates': len(candidates),
+                'frequent': len(new_frequent),
+                'support': self.min_support
+            })
+
+            print(f"📊 Itération {k} : {len(new_frequent)} itemsets fréquents trouvés")
             current_frequent = new_frequent
             k += 1
-        
-        print(f"\n✅ Apriori terminé ({k-1} itérations)")
-        print(f"📦 Total itemsets fréquents: {sum(len(v) for v in self.frequent_itemsets.values())}")
+
+        self.execution_time = time.time() - start_time
+        print(f"\n✅ Apriori terminé ({k - 1} itérations) en {self.execution_time:.2f}s")
+        print(f"📦 Total itemsets fréquents : {sum(len(v) for v in self.frequent_itemsets.values())}")
         return self
 
+    # ============================================================
+    # SOUS-FONCTIONS
+    # ============================================================
+
+    def _prepare_matrix_representation(self):
+        """Prépare une représentation matricielle (dense ou creuse)."""
+        all_items = sorted({item for t in self.transactions for item in t})
+        self.item_to_idx = {item: i for i, item in enumerate(all_items)}
+        self.idx_to_item = {i: item for item, i in self.item_to_idx.items()}
+
+        n_items = len(all_items)
+        avg_len = np.mean([len(t) for t in self.transactions])
+        density = avg_len / n_items if n_items > 0 else 0
+
+        self.use_sparse = density < 0.3  # Seuil de densité
+        print(f"📊 Statistiques matrice : items={n_items}, transactions={self.n_transactions}, "
+              f"taille_moy={avg_len:.2f}, densité={density*100:.1f}%")
+
+        if self.use_sparse:
+            mat = lil_matrix((self.n_transactions, n_items), dtype=bool)
+            for t_idx, transaction in enumerate(self.transactions):
+                for item in transaction:
+                    mat[t_idx, self.item_to_idx[item]] = True
+            self.transaction_matrix = mat.tocsr()
+
+    def _count_support_sparse(self, candidates):
+        """Comptage optimisé du support avec matrice creuse."""
+        candidate_counts = defaultdict(int)
+        X = self.transaction_matrix
+
+        for candidate in candidates:
+            indices = [self.item_to_idx[item] for item in candidate]
+            if len(indices) == 1:
+                count = X[:, indices[0]].sum()
+            else:
+                mask = np.all(X[:, indices].toarray(), axis=1)
+                count = np.sum(mask)
+            candidate_counts[candidate] = int(count)
+
+        return candidate_counts
+
     def calculate_adaptive_support(self):
-        """Calcul initial adaptatif du support basé sur les caractéristiques du dataset"""
+        """Calcul initial adaptatif du support."""
         print("\n⚙️ Calcul du support minimal adaptatif initial")
-        print("="*70)
-        
-        avg_length = sum(len(t) for t in self.transactions) / len(self.transactions)
-        unique_items = len(set(item for t in self.transactions for item in t))
-        density = avg_length / unique_items if unique_items > 0 else 0
-        
-        # Heuristique initiale
-        base_support = 0.02
-        if self.n_transactions < 100:
-            size_factor = 0.15
-        elif self.n_transactions < 500:
-            size_factor = 0.08
-        else:
-            size_factor = 0.03
+        print("=" * 70)
+
+        if not self.transactions:
+            self.min_support = 0.05
+            return self.min_support
+
+        avg_len = np.mean([len(t) for t in self.transactions])
+        unique_items = len({item for t in self.transactions for item in t})
+        density = avg_len / unique_items if unique_items else 0
+
+        base = 0.02
+        size_factor = 0.15 if self.n_transactions < 100 else (0.08 if self.n_transactions < 500 else 0.03)
         density_factor = max(0.01, min(0.1, density * 0.5))
-        support = max(base_support, min(0.3, size_factor + density_factor))
-        
+        support = max(base, min(0.3, size_factor + density_factor))
+
         self.min_support = support
-        print(f"✅ Support initial calculé: {support:.4f}")
+        print(f"✅ Support initial calculé : {support:.4f} (densité={density:.2%})")
         return support
 
-    # Autres méthodes (_generate_candidates, _has_frequent_subsets, _get_support, generate_rules, analyze_results, etc.)
-    # inchangées
-    
     def _generate_candidates(self, frequent_itemsets, k):
-        """Génère les candidats de taille k selon Apriori"""
+        """Génère les candidats de taille k."""
         candidates = set()
-        itemsets_list = sorted([tuple(sorted(itemset)) for itemset in frequent_itemsets.keys()])
-        
-        for i in range(len(itemsets_list)):
-            for j in range(i+1, len(itemsets_list)):
-                itemset1 = itemsets_list[i]
-                itemset2 = itemsets_list[j]
-                # Vérification du préfixe commun
-                if itemset1[:-1] == itemset2[:-1]:
-                    new_candidate = frozenset(itemset1 + (itemset2[-1],))
-                    # Élagage basé sur la propriété antimonotone
-                    if self._has_frequent_subsets(new_candidate, frequent_itemsets, k):
-                        candidates.add(new_candidate)
+        itemsets = sorted([tuple(sorted(i)) for i in frequent_itemsets.keys()])
+
+        for i in range(len(itemsets)):
+            for j in range(i + 1, len(itemsets)):
+                a, b = itemsets[i], itemsets[j]
+                if a[:-1] == b[:-1]:
+                    new = frozenset(a + (b[-1],))
+                    if self._has_frequent_subsets(new, frequent_itemsets):
+                        candidates.add(new)
         return candidates
-    
-    def _has_frequent_subsets(self, candidate, frequent_itemsets, k):
-        """Vérifie que tous les sous-ensembles de taille k-1 sont fréquents"""
+
+    def _has_frequent_subsets(self, candidate, frequent_itemsets):
+        """Vérifie la propriété antimonotone."""
         for item in candidate:
             subset = candidate - frozenset([item])
             if subset not in frequent_itemsets:
                 return False
         return True
-    
+
+    # ============================================================
+    # RÈGLES D’ASSOCIATION
+    # ============================================================
+
     def _get_support(self, itemset):
-        """Retourne le support d'un itemset"""
+        """Retourne le support d’un itemset."""
         k = len(itemset)
         if k in self.frequent_itemsets:
-            for data in self.frequent_itemsets[k]:
-                if frozenset(data['itemset']) == itemset:
-                    return data['support']
+            for d in self.frequent_itemsets[k]:
+                if frozenset(d['itemset']) == itemset:
+                    return d['support']
         return 0
-    
+
     def generate_rules(self):
-        """Génère les règles d'association avec support et confiance"""
-        print("\n🎯 Génération des règles d'association")
-        print("="*70)
+        """Génère les règles d’association (avec lift et confiance)."""
+        print("\n🎯 Génération des règles d’association")
+        print("=" * 70)
         self.rules = []
-        
+
         for k, itemsets in self.frequent_itemsets.items():
             if k < 2:
                 continue
             for data in itemsets:
                 itemset = frozenset(data['itemset'])
-                itemset_support = data['support']
-                
-                # Génération de toutes les règles possibles
+                s_itemset = data['support']
+
                 for i in range(1, len(itemset)):
                     for antecedent in combinations(itemset, i):
                         antecedent = frozenset(antecedent)
                         consequent = itemset - antecedent
-                        antecedent_support = self._get_support(antecedent)
-                        
-                        if antecedent_support == 0:
+                        s_ant = self._get_support(antecedent)
+                        s_con = self._get_support(consequent)
+                        if s_ant == 0:
                             continue
-                        
-                        confidence = itemset_support / antecedent_support
-                        
+
+                        confidence = s_itemset / s_ant
+                        lift = confidence / s_con if s_con > 0 else 0
+
                         if confidence >= self.min_confidence:
                             self.rules.append({
                                 'antecedent': list(antecedent),
                                 'consequent': list(consequent),
-                                'support': itemset_support,
-                                'confidence': confidence
+                                'support': s_itemset,
+                                'confidence': confidence,
+                                'lift': lift
                             })
-        
-        # Tri par confiance puis support
+
         self.rules.sort(key=lambda x: (-x['confidence'], -x['support']))
-        print(f"✅ {len(self.rules)} règles générées")
+        print(f"✅ {len(self.rules)} règles générées.")
         return self.rules
-    
-    def analyze_results(self, top_n=5):
-        """Analyse détaillée des résultats avec support et confiance"""
-        print("\n" + "="*70)
-        print(f"📋 ANALYSE DES RÉSULTATS (TOP {top_n})")
-        print("="*70)
-        
-        if not self.rules:
-            print("❌ Aucune règle trouvée.")
-            return
-        
-        # TOP N des règles par confiance
-        print(f"\n🥇 TOP {top_n} RÈGLES PAR CONFIANCE :")
-        print("-"*70)
-        for i, rule in enumerate(self.rules[:top_n], 1):
-            self._print_rule(rule, i)
-        
-        # TOP N des règles par support
-        print(f"\n📊 TOP {top_n} RÈGLES PAR SUPPORT :")
-        print("-"*70)
-        sorted_by_support = sorted(self.rules, key=lambda r: -r['support'])
-        for i, rule in enumerate(sorted_by_support[:top_n], 1):
-            self._print_rule(rule, i)
-        
-        # Statistiques globales
-        print("\n📊 STATISTIQUES GLOBALES :")
-        print("-"*70)
-        confidences = [r['confidence'] for r in self.rules]
-        supports = [r['support'] for r in self.rules]
-        
-        print(f"Nombre total de règles: {len(self.rules)}")
-        print(f"Confiance moyenne: {np.mean(confidences):.3f}")
-        print(f"Confiance médiane: {np.median(confidences):.3f}")
-        print(f"Confiance min/max: {min(confidences):.3f}/{max(confidences):.3f}")
-        print(f"Support moyen: {np.mean(supports):.3f}")
-        print(f"Support médian: {np.median(supports):.3f}")
-        print(f"Support min/max: {min(supports):.3f}/{max(supports):.3f}")
-    
-    def _print_rule(self, rule, index):
-        """Affichage formaté d'une règle"""
-        antecedent = ' ET '.join(sorted(rule['antecedent']))
-        consequent = ' ET '.join(sorted(rule['consequent']))
-        
-        print(f"\n📌 RÈGLE #{index}")
-        print(f"   SI [{antecedent}]")
-        print(f"   → ALORS [{consequent}]")
-        print(f"   📊 Support={rule['support']:.3f} | Confiance={rule['confidence']:.3f}")
-    
-    def export_results(self, filepath='apriori_results.csv'):
-        """Exporte les résultats vers un fichier CSV"""
-        import pandas as pd
-        
-        if not self.rules:
-            print("⚠️  Aucune règle à exporter")
-            return
-        
-        export_data = []
-        for rule in self.rules:
-            export_data.append({
-                'Antecedent': ' & '.join(sorted(rule['antecedent'])),
-                'Consequent': ' & '.join(sorted(rule['consequent'])),
-                'Support': rule['support'],
-                'Confidence': rule['confidence']
-            })
-        
-        df = pd.DataFrame(export_data)
-        df.to_csv(filepath, index=False, encoding='utf-8')
-        print(f"✅ Résultats exportés vers: {filepath}")
+
+    def get_statistics(self):
+        """Retourne des statistiques détaillées d'exécution."""
+        return {
+            'execution_time': self.execution_time,
+            'total_transactions': self.n_transactions,
+            'total_rules': len(self.rules),
+            'total_frequent_itemsets': sum(len(v) for v in self.frequent_itemsets.values()),
+            'initial_support': self.initial_support,
+            'final_support': self.min_support,
+            'use_sparse_matrix': self.use_sparse,
+            'support_history': self.support_history,
+            'iteration_stats': self.iteration_stats,
+            'itemsets_by_size': {k: len(v) for k, v in self.frequent_itemsets.items()}
+        }
