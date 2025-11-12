@@ -64,6 +64,28 @@ class Apriori:
                     if candidate.issubset(tset):
                         candidate_counts[candidate] += 1
             
+            # 🔥 On calcule tous les supports bruts à cette itération
+            all_supports = np.array([count / self.n_transactions for count in candidate_counts.values()])
+            
+            # 🔥 Recalcul du min_support dynamique selon la distribution actuelle
+            if len(all_supports) > 0:
+                mean_support = np.mean(all_supports)
+                std_support = np.std(all_supports)
+                
+                # On écarte les valeurs extrêmes (au-delà de 2 écarts-types)
+                filtered_supports = [s for s in all_supports if abs(s - mean_support) <= 2 * std_support]
+                
+                if len(filtered_supports) > 0:
+                    adjusted_mean = np.mean(filtered_supports)
+                else:
+                    adjusted_mean = mean_support
+                
+                # On ajuste le min_support avec un facteur de stabilité
+                prev_support = self.min_support
+                self.min_support = max(0.01, min(0.5, 0.5 * prev_support + 0.5 * adjusted_mean))
+                
+                print(f"⚙️  Support recalculé à l’itération {k}: moyenne={adjusted_mean:.4f}, σ={std_support:.4f} → min_support={self.min_support:.4f}")
+            
             new_frequent = {
                 itemset: count / self.n_transactions
                 for itemset, count in candidate_counts.items()
@@ -85,51 +107,33 @@ class Apriori:
         print(f"\n✅ Apriori terminé ({k-1} itérations)")
         print(f"📦 Total itemsets fréquents: {sum(len(v) for v in self.frequent_itemsets.values())}")
         return self
-    
+
     def calculate_adaptive_support(self):
-        """
-        Calcul adaptatif du support basé sur les caractéristiques réelles du dataset.
-        
-        """
-        print("\n⚙️ Calcul du support minimal adaptatif")
+        """Calcul initial adaptatif du support basé sur les caractéristiques du dataset"""
+        print("\n⚙️ Calcul du support minimal adaptatif initial")
         print("="*70)
         
-        # Calcul des métriques du dataset
         avg_length = sum(len(t) for t in self.transactions) / len(self.transactions)
         unique_items = len(set(item for t in self.transactions for item in t))
-        max_length = max(len(t) for t in self.transactions)
-        min_length = min(len(t) for t in self.transactions)
-        
-        # Calcul de la densité
         density = avg_length / unique_items if unique_items > 0 else 0
         
-        # Heuristique améliorée basée sur plusieurs facteurs
-        base_support = 0.02  # Support de base minimal
-        
-        # Ajustement selon la taille du dataset
+        # Heuristique initiale
+        base_support = 0.02
         if self.n_transactions < 100:
             size_factor = 0.15
         elif self.n_transactions < 500:
             size_factor = 0.08
         else:
             size_factor = 0.03
-        
-        # Ajustement selon la densité
         density_factor = max(0.01, min(0.1, density * 0.5))
-        
-        # Support final
         support = max(base_support, min(0.3, size_factor + density_factor))
         
         self.min_support = support
-        
-        print(f"📈 Statistiques du dataset:")
-        print(f"   - Transactions: {self.n_transactions}")
-        print(f"   - Items uniques: {unique_items}")
-        print(f"   - Longueur moyenne: {avg_length:.2f}")
-        print(f"   - Longueur min/max: {min_length}/{max_length}")
-        print(f"   - Densité: {density:.4f}")
-        print(f"✅ Support adaptatif calculé: {support:.4f}")
+        print(f"✅ Support initial calculé: {support:.4f}")
         return support
+
+    # Autres méthodes (_generate_candidates, _has_frequent_subsets, _get_support, generate_rules, analyze_results, etc.)
+    # inchangées
     
     def _generate_candidates(self, frequent_itemsets, k):
         """Génère les candidats de taille k selon Apriori"""
