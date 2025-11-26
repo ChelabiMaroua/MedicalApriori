@@ -3,10 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from core.apriori import Apriori
+from core.kmeans import KMeans
 from data.loader import HeartFailureDataLoader
 from collections import Counter, defaultdict
 import numpy as np
 from scipy.sparse import spmatrix
+import pandas as pd
 import logging
 
 # Configuration du logging
@@ -15,11 +17,11 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="CardioAI API",
-    version="2.1",
-    description="API d'analyse de données cardiaques avec algorithme Apriori optimisé"
+    version="2.2",
+    description="API d'analyse de données cardiaques avec Apriori et K-Means"
 )
 
-# Configuration CORS améliorée
+# Configuration CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000"],
@@ -34,18 +36,13 @@ app.add_middleware(
 # =====================
 
 class AprioriParams(BaseModel):
-    min_support: Optional[float] = Field(
-        default=None, 
-        ge=0.01, 
-        le=1.0,
-        description="Support minimal (auto si None)"
-    )
-    min_confidence: float = Field(
-        default=0.7, 
-        ge=0.0, 
-        le=1.0,
-        description="Confiance minimale pour les règles"
-    )
+    min_support: Optional[float] = Field(default=None, ge=0.01, le=1.0)
+    min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+
+class KMeansParams(BaseModel):
+    n_clusters: int = Field(default=3, ge=2, le=10, description="Nombre de clusters")
+    max_iterations: int = Field(default=100, ge=10, le=1000)
+    random_state: Optional[int] = Field(default=42)
 
 class AprioriResponse(BaseModel):
     success: bool
@@ -57,28 +54,34 @@ class AprioriResponse(BaseModel):
     execution_time: float
     matrix_type: str
 
+class KMeansResponse(BaseModel):
+    success: bool
+    clusters: List[Dict[str, Any]]
+    statistics: Dict[str, Any]
+    labels: List[int]
+    centroids: List[List[float]]
+    silhouette_score: float
+    execution_time: float
+
 class DatasetInfoResponse(BaseModel):
     total_transactions: int
     total_unique_items: int
     avg_transaction_length: float
     top_items: List[Dict[str, Any]]
     categories: Dict[str, int]
+    numerical_stats: Optional[Dict[str, Any]] = None
 
 class HealthResponse(BaseModel):
     status: str
     service: str
     version: str
 
-
 # =====================
 # 🛠️ Utilitaires
 # =====================
 
 def to_native(obj):
-    """
-    Conversion robuste de tous types NumPy/SciPy en types Python natifs.
-    Gère np.int64, np.float64, np.bool_, matrices creuses, etc.
-    """
+    """Conversion robuste de tous types NumPy/SciPy en types Python natifs."""
     if isinstance(obj, np.generic):
         return obj.item()
     elif isinstance(obj, np.ndarray):
@@ -100,7 +103,6 @@ def to_native(obj):
     else:
         return str(obj)
 
-
 # =====================
 # 🚀 Endpoints API
 # =====================
@@ -108,30 +110,17 @@ def to_native(obj):
 @app.post("/run_apriori", response_model=AprioriResponse)
 async def run_apriori(params: AprioriParams):
     """
-    🔬 Exécute l'algorithme Apriori optimisé avec:
-    - Support adaptatif intelligent
-    - Détection d'outliers statistiques
-    - Matrices creuses/denses optimisées
-    - Métriques avancées (lift, conviction, leverage)
+    🔬 Exécute l'algorithme Apriori optimisé
     """
     try:
         logger.info(f"Démarrage Apriori avec params: {params}")
         
-        # Chargement des données
         data_loader = HeartFailureDataLoader()
         transactions = data_loader.load_dataset()
         
         if not transactions:
             raise HTTPException(status_code=400, detail="Aucune transaction chargée")
 
-        # Validation des paramètres
-        if params.min_support is not None and not (0.01 <= params.min_support <= 1.0):
-            raise HTTPException(
-                status_code=400, 
-                detail="min_support doit être entre 0.01 et 1.0"
-            )
-
-        # Exécution de l'algorithme
         apriori = Apriori(
             min_support=params.min_support,
             min_confidence=params.min_confidence
@@ -140,11 +129,9 @@ async def run_apriori(params: AprioriParams):
         rules = apriori.generate_rules()
         statistics = apriori.get_statistics()
 
-        # Conversion en types Python natifs
         rules_native = to_native(rules)
         statistics_native = to_native(statistics)
         
-        # Extraction des attributs uniques
         attributes = sorted({
             str(item) 
             for rule in rules_native 
@@ -162,50 +149,135 @@ async def run_apriori(params: AprioriParams):
             matrix_type="Sparse (CSR)" if statistics_native['use_sparse_matrix'] else "Dense (NumPy)"
         )
         
-        logger.info(f"Apriori terminé: {len(rules_native)} règles, {statistics_native['execution_time']:.2f}s")
+        logger.info(f"Apriori terminé: {len(rules_native)} règles")
         return response
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erreur lors de l'exécution d'Apriori: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Erreur interne: {str(e)}"
+        logger.error(f"Erreur Apriori: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erreur interne: {str(e)}")
+
+
+@app.post("/run_kmeans", response_model=KMeansResponse)
+async def run_kmeans(params: KMeansParams):
+    """
+    🎯 Exécute l'algorithme K-Means sur les données numériques
+    """
+    try:
+        logger.info(f"Démarrage K-Means avec params: {params}")
+        
+        # Chargement et préparation des données
+        data_loader = HeartFailureDataLoader()
+        df = data_loader.get_dataframe()
+        
+        if df is None or df.empty:
+            raise HTTPException(status_code=400, detail="Dataset vide")
+        
+        # Sélection des colonnes numériques
+        numerical_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if not numerical_cols:
+            raise HTTPException(status_code=400, detail="Aucune colonne numérique trouvée")
+        
+        X = df[numerical_cols].values
+        
+        # Normalisation des données
+        X_normalized = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
+        
+        # Exécution K-Means
+        kmeans = KMeans(
+            n_clusters=params.n_clusters,
+            max_iterations=params.max_iterations,
+            random_state=params.random_state
         )
+        kmeans.fit(X_normalized)
+        
+        # Calcul du score de silhouette
+        silhouette = kmeans.calculate_silhouette_score(X_normalized)
+        
+        statistics = kmeans.get_statistics()
+        
+        # Enrichissement des statistiques de cluster
+        clusters_info = []
+        for i in range(params.n_clusters):
+            cluster_mask = kmeans.labels == i
+            cluster_data = df[cluster_mask]
+            
+            clusters_info.append({
+                'cluster_id': i,
+                'size': int(statistics['cluster_stats'][i]['size']),
+                'percentage': float(statistics['cluster_stats'][i]['percentage']),
+                'centroid': statistics['cluster_stats'][i]['centroid'],
+                'features': {
+                    col: {
+                        'mean': float(cluster_data[col].mean()),
+                        'std': float(cluster_data[col].std()),
+                        'min': float(cluster_data[col].min()),
+                        'max': float(cluster_data[col].max())
+                    }
+                    for col in numerical_cols
+                }
+            })
+        
+        response = KMeansResponse(
+            success=True,
+            clusters=clusters_info,
+            statistics=to_native(statistics),
+            labels=to_native(kmeans.labels),
+            centroids=to_native(kmeans.centroids),
+            silhouette_score=float(silhouette),
+            execution_time=float(statistics['execution_time'])
+        )
+        
+        logger.info(f"K-Means terminé: {params.n_clusters} clusters, silhouette={silhouette:.3f}")
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur K-Means: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erreur interne: {str(e)}")
 
 
 @app.get("/dataset_info", response_model=DatasetInfoResponse)
 async def get_dataset_info():
     """
-    📊 Informations détaillées sur le dataset:
-    - Nombre de transactions (patients)
-    - Items uniques et fréquences
-    - Distribution par catégories
-    - Top items les plus fréquents
+    📊 Informations détaillées sur le dataset
     """
     try:
-        logger.info("Récupération des informations du dataset")
-        
         data_loader = HeartFailureDataLoader()
         transactions = data_loader.load_dataset()
+        df = data_loader.get_dataframe()
         
         if not transactions:
-            raise HTTPException(status_code=400, detail="Dataset vide ou non trouvé")
+            raise HTTPException(status_code=400, detail="Dataset vide")
         
         # Analyse des items
         all_items = [item for t in transactions for item in t]
         item_counts = Counter(all_items)
         
-        # Regroupement par catégories
         categories: Dict[str, int] = defaultdict(int)
         for item in item_counts.keys():
             category = item.split('_')[0] if '_' in item else "other"
             categories[category] += 1
         
-        # Statistiques
         transaction_lengths = [len(t) for t in transactions]
         avg_len = np.mean(transaction_lengths)
+        
+        # Statistiques numériques si disponibles
+        numerical_stats = None
+        if df is not None:
+            numerical_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            if numerical_cols:
+                numerical_stats = {
+                    col: {
+                        'mean': float(df[col].mean()),
+                        'std': float(df[col].std()),
+                        'min': float(df[col].min()),
+                        'max': float(df[col].max())
+                    }
+                    for col in numerical_cols
+                }
         
         response = DatasetInfoResponse(
             total_transactions=len(transactions),
@@ -219,108 +291,43 @@ async def get_dataset_info():
                 }
                 for item, count in item_counts.most_common(15)
             ],
-            categories={k: int(v) for k, v in dict(categories).items()}
+            categories={k: int(v) for k, v in dict(categories).items()},
+            numerical_stats=numerical_stats
         )
         
-        logger.info(f"Dataset info: {len(transactions)} transactions, {len(item_counts)} items")
         return response
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erreur lors de la récupération des infos dataset: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erreur interne: {str(e)}"
-        )
+        logger.error(f"Erreur dataset info: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erreur interne: {str(e)}")
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """
-    🩺 Vérification de la santé du service
-    """
-    return HealthResponse(
-        status="healthy",
-        service="CardioAI API",
-        version="2.1"
-    )
+    """🩺 Vérification de la santé du service"""
+    return HealthResponse(status="healthy", service="CardioAI API", version="2.2")
 
 
 @app.get("/")
 async def root():
-    """
-    📌 Point d'entrée principal avec documentation
-    """
+    """📌 Point d'entrée principal"""
     return {
         "service": "CardioAI API",
-        "version": "2.1",
-        "description": "API d'analyse de données cardiaques avec Apriori",
+        "version": "2.2",
+        "description": "API d'analyse de données cardiaques",
         "endpoints": {
-            "POST /run_apriori": "Exécuter l'algorithme Apriori",
-            "GET /dataset_info": "Informations sur le dataset",
-            "GET /health": "Vérification de santé",
-            "GET /docs": "Documentation interactive Swagger"
+            "POST /run_apriori": "Algorithme Apriori",
+            "POST /run_kmeans": "Algorithme K-Means",
+            "GET /dataset_info": "Informations dataset",
+            "GET /health": "Santé du service",
+            "GET /docs": "Documentation Swagger"
         },
-        "features": [
-            "Support adaptatif intelligent",
-            "Détection d'outliers statistiques",
-            "Matrices optimisées (sparse/dense)",
-            "Métriques avancées (lift, conviction, leverage)"
-        ]
+        "algorithms": ["Apriori", "K-Means"]
     }
 
 
-@app.on_event("startup")
-async def startup_event():
-    """
-    🚀 Initialisation au démarrage
-    """
-    logger.info("=" * 70)
-    logger.info("🚀 CardioAI API v2.1 démarrage...")
-    logger.info("=" * 70)
-    
-    try:
-        # Vérification du dataset
-        data_loader = HeartFailureDataLoader()
-        transactions = data_loader.load_dataset()
-        logger.info(f"✅ Dataset chargé: {len(transactions)} transactions")
-    except Exception as e:
-        logger.warning(f"⚠️  Impossible de charger le dataset au démarrage: {e}")
-    
-    logger.info("=" * 70)
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """
-    🛑 Nettoyage à l'arrêt
-    """
-    logger.info("🛑 Arrêt de CardioAI API v2.1")
-
-
-# =====================
-# ⚙️ Point d'entrée
-# =====================
 if __name__ == "__main__":
     import uvicorn
-    
-    print("\n" + "=" * 70)
-    print("🚀 Démarrage du serveur CardioAI API v2.1")
-    print("=" * 70)
-    print("📡 URL: http://127.0.0.1:8000")
-    print("📚 Documentation: http://127.0.0.1:8000/docs")
-    print("🔬 Endpoints:")
-    print("   • POST /run_apriori")
-    print("   • GET  /dataset_info")
-    print("   • GET  /health")
-    print("=" * 70 + "\n")
-    
-    uvicorn.run(
-        "main:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True,
-        log_level="info",
-        access_log=True
-    )
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
