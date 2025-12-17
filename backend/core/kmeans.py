@@ -96,65 +96,76 @@ class KMeans:
                 inertia += np.sum((cluster_points - self.centroids[i]) ** 2)
         return inertia
     
-    def fit(self, X: np.ndarray) -> 'KMeans':
-        """
-        Entraîne le modèle K-Means sur les données X.
+    # Dans core/kmeans.py, modifiez la méthode fit :
+
+def fit(self, X: np.ndarray, initial_centroids: Optional[np.ndarray] = None) -> 'KMeans':
+    """
+    Entraîne le modèle K-Means sur les données X.
+    
+    Args:
+        X: Matrice de données (n_samples, n_features)
+        initial_centroids: Centroïdes initiaux optionnels
         
-        Args:
-            X: Matrice de données (n_samples, n_features)
-            
-        Returns:
-            self: Instance entraînée
-        """
-        start_time = time.time()
-        
-        print(f"\n🎯 Démarrage K-Means")
-        print("=" * 70)
-        print(f"📊 Données: {X.shape[0]} échantillons, {X.shape[1]} features")
+    Returns:
+        self: Instance entraînée
+    """
+    start_time = time.time()
+    
+    print(f"\n🎯 Démarrage K-Means")
+    print("=" * 70)
+    print(f"📊 Données: {X.shape[0]} échantillons, {X.shape[1]} features")
+    
+    if initial_centroids is not None:
+        # Utiliser les centroïdes fournis
+        self.centroids = initial_centroids
+        self.n_clusters = len(initial_centroids)
         print(f"🔢 Nombre de clusters: {self.n_clusters}")
-        print(f"⚙️ Initialisation: K-Means++")
-        
+        print(f"⚙️ Initialisation: Centroïdes fournis par l'utilisateur")
+    else:
         # Initialisation K-Means++
         self.centroids = self._initialize_centroids_plus_plus(X)
+        print(f"🔢 Nombre de clusters: {self.n_clusters}")
+        print(f"⚙️ Initialisation: K-Means++")
+    
+    # Le reste du code reste inchangé...
+    # Itérations
+    for iteration in range(self.max_iterations):
+        # Assignation des clusters
+        new_labels = self._assign_clusters(X)
         
-        # Itérations
-        for iteration in range(self.max_iterations):
-            # Assignation des clusters
-            new_labels = self._assign_clusters(X)
-            
-            # Mise à jour des centroïdes
-            new_centroids = self._update_centroids(X, new_labels)
-            
-            # Vérification de la convergence
-            centroid_shift = np.linalg.norm(new_centroids - self.centroids)
-            
-            if iteration % 10 == 0 or centroid_shift < self.tolerance:
-                inertia = self._calculate_inertia(X, new_labels)
-                print(f"📈 Itération {iteration}: Inertie = {inertia:.2f}, "
-                      f"Déplacement = {centroid_shift:.6f}")
-            
-            self.centroids = new_centroids
-            self.labels = new_labels
-            self.n_iterations = iteration + 1
-            
-            # Convergence atteinte
-            if centroid_shift < self.tolerance:
-                print(f"✅ Convergence atteinte à l'itération {iteration}")
-                break
+        # Mettre à jour les centroïdes
+        new_centroids = self._update_centroids(X, new_labels)
         
-        # Calcul de l'inertie finale
-        self.inertia = self._calculate_inertia(X, self.labels)
+        # Vérification de la convergence
+        centroid_shift = np.linalg.norm(new_centroids - self.centroids)
         
-        # Statistiques par cluster
-        self._calculate_cluster_statistics(X)
+        if iteration % 10 == 0 or centroid_shift < self.tolerance:
+            inertia = self._calculate_inertia(X, new_labels)
+            print(f"📈 Itération {iteration}: Inertie = {inertia:.2f}, "
+                  f"Déplacement = {centroid_shift:.6f}")
         
-        self.execution_time = time.time() - start_time
+        self.centroids = new_centroids
+        self.labels = new_labels
+        self.n_iterations = iteration + 1
         
-        print(f"\n✅ K-Means terminé en {self.execution_time:.2f}s")
-        print(f"🎯 Inertie finale: {self.inertia:.2f}")
-        print(f"🔄 Itérations: {self.n_iterations}")
-        
-        return self
+        # Convergence atteinte
+        if centroid_shift < self.tolerance:
+            print(f"✅ Convergence atteinte à l'itération {iteration}")
+            break
+    
+    # Calcul de l'inertie finale
+    self.inertia = self._calculate_inertia(X, self.labels)
+    
+    # Statistiques par cluster
+    self._calculate_cluster_statistics(X)
+    
+    self.execution_time = time.time() - start_time
+    
+    print(f"\n✅ K-Means terminé en {self.execution_time:.2f}s")
+    print(f"🎯 Inertie finale: {self.inertia:.2f}")
+    print(f"🔄 Itérations: {self.n_iterations}")
+    
+    return self
     
     def predict(self, X: np.ndarray) -> np.ndarray:
         """

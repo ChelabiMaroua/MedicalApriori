@@ -1,15 +1,15 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
-from core.apriori import Apriori
-from core.kmeans import KMeans
-from data.loader import HeartFailureDataLoader
-from collections import Counter, defaultdict
 import numpy as np
-from scipy.sparse import spmatrix
 import pandas as pd
 import logging
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import json
+from scipy.spatial.distance import cdist
+import random
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="CardioAI API",
-    version="2.2",
-    description="API d'analyse de données cardiaques avec Apriori et K-Means"
+    version="2.3",
+    description="API d'analyse de données cardiaques avec clustering interactif"
 )
 
 # Configuration CORS
@@ -35,298 +35,444 @@ app.add_middleware(
 # 📦 Modèles Pydantic
 # =====================
 
-class AprioriParams(BaseModel):
-    min_support: Optional[float] = Field(default=None, ge=0.01, le=1.0)
-    min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+class InteractiveClusteringParams(BaseModel):
+    selected_points: List[int]
+    min_distance: float
+    auto_distance: bool = False
 
-class KMeansParams(BaseModel):
-    n_clusters: int = Field(default=3, ge=2, le=10, description="Nombre de clusters")
-    max_iterations: int = Field(default=100, ge=10, le=1000)
-    random_state: Optional[int] = Field(default=42)
-
-class AprioriResponse(BaseModel):
-    success: bool
-    rules: List[Dict[str, Any]]
-    attributes: List[str]
-    statistics: Dict[str, Any]
-    total_rules: int
-    total_transactions: int
-    execution_time: float
-    matrix_type: str
-
-class KMeansResponse(BaseModel):
-    success: bool
-    clusters: List[Dict[str, Any]]
-    statistics: Dict[str, Any]
-    labels: List[int]
-    centroids: List[List[float]]
-    silhouette_score: float
-    execution_time: float
-
-class DatasetInfoResponse(BaseModel):
-    total_transactions: int
-    total_unique_items: int
-    avg_transaction_length: float
-    top_items: List[Dict[str, Any]]
-    categories: Dict[str, int]
-    numerical_stats: Optional[Dict[str, Any]] = None
-
-class HealthResponse(BaseModel):
-    status: str
-    service: str
-    version: str
+class KMeansInitParams(BaseModel):
+    n_clusters: int
+    initial_centroids: List[List[float]]
 
 # =====================
-# 🛠️ Utilitaires
+# 🗄️ Gestion des données
 # =====================
 
-def to_native(obj):
-    """Conversion robuste de tous types NumPy/SciPy en types Python natifs."""
-    if isinstance(obj, np.generic):
-        return obj.item()
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, spmatrix):
-        return obj.toarray().tolist()
-    elif isinstance(obj, (list, tuple)):
-        return [to_native(i) for i in obj]
-    elif isinstance(obj, dict):
-        return {str(k): to_native(v) for k, v in obj.items()}
-    elif isinstance(obj, (bool, int, float, str, type(None))):
-        return obj
-    elif isinstance(obj, (np.bool_)):
-        return bool(obj)
-    elif isinstance(obj, (np.integer)):
-        return int(obj)
-    elif isinstance(obj, (np.floating)):
-        return float(obj)
-    else:
-        return str(obj)
+class HeartDataManager:
+    def __init__(self):
+        self.data = None
+        self.scaled_data = None
+        self.scaler = None
+        self.pca_2d = None
+        self.pca_3d = None
+        self.data_2d = None
+        self.data_3d = None
+        self.feature_names = None
+        self.load_data()
+    
+    def load_data(self):
+        """Charge et prépare les données"""
+        try:
+            # Charger depuis le CSV
+            df = pd.read_csv('heart_failure.csv')  # Assurez-vous que le fichier est dans le même dossier
+            
+            # Extraire les colonnes numériques
+            numeric_cols = ['Age', 'RestingBP', 'Cholesterol', 'FastingBS', 'MaxHR', 'Oldpeak']
+            
+            # Vérifier que les colonnes existent
+            available_numeric = [col for col in numeric_cols if col in df.columns]
+            
+            if not available_numeric:
+                raise ValueError("Aucune colonne numérique trouvée")
+            
+            self.data = df[available_numeric].copy()
+            self.feature_names = available_numeric
+            
+            # Standardisation
+            self.scaler = StandardScaler()
+            self.scaled_data = self.scaler.fit_transform(self.data)
+            
+            # Réduction de dimension pour la visualisation
+            self.pca_2d = PCA(n_components=2)
+            self.data_2d = self.pca_2d.fit_transform(self.scaled_data)
+            
+            self.pca_3d = PCA(n_components=3)
+            self.data_3d = self.pca_3d.fit_transform(self.scaled_data)
+            
+            logger.info(f"Données chargées: {len(self.data)} échantillons, {len(self.feature_names)} features")
+            
+        except Exception as e:
+            logger.error(f"Erreur chargement données: {e}")
+            # Créer des données de test si le fichier n'existe pas
+            self._create_sample_data()
+    
+    def _create_sample_data(self):
+        """Crée des données de test pour le développement"""
+        n_samples = 100
+        n_features = 6
+        
+        np.random.seed(42)
+        self.data = pd.DataFrame(
+            np.random.randn(n_samples, n_features),
+            columns=[f'Feature_{i}' for i in range(n_features)]
+        )
+        self.feature_names = list(self.data.columns)
+        
+        self.scaler = StandardScaler()
+        self.scaled_data = self.scaler.fit_transform(self.data)
+        
+        self.pca_2d = PCA(n_components=2)
+        self.data_2d = self.pca_2d.fit_transform(self.scaled_data)
+        
+        logger.info(f"Données de test créées: {len(self.data)} échantillons")
+    
+    def get_scaled_point(self, index: int) -> List[float]:
+        """Retourne un point standardisé"""
+        if index < 0 or index >= len(self.scaled_data):
+            raise ValueError(f"Index {index} hors limites")
+        return self.scaled_data[index].tolist()
+    
+    def get_2d_point(self, index: int) -> List[float]:
+        """Retourne un point en 2D pour visualisation"""
+        if index < 0 or index >= len(self.data_2d):
+            raise ValueError(f"Index {index} hors limites")
+        return self.data_2d[index].tolist()
+
+# Instance globale du gestionnaire de données
+data_manager = HeartDataManager()
+
+# =====================
+# 🔬 Algorithmes de clustering
+# =====================
+
+class DistanceBasedClustering:
+    """Clustering basé sur la distance avec sélection interactive"""
+    
+    @staticmethod
+    def calculate_auto_distance(data: np.ndarray) -> float:
+        """
+        Calcule automatiquement la distance minimale optimale
+        Basé sur l'article: A Distributed Clustering with Intelligent Multi Agents System
+        """
+        n_samples = len(data)
+        
+        if n_samples < 10:
+            return 0.5
+        
+        # Échantillonner aléatoirement pour accélérer le calcul
+        sample_size = min(100, n_samples)
+        indices = random.sample(range(n_samples), sample_size)
+        sample_data = data[indices]
+        
+        # Calculer les distances aux k plus proches voisins
+        k = min(5, sample_size - 1)
+        distances = []
+        
+        for i in range(sample_size):
+            # Calculer les distances à tous les autres points
+            point_distances = np.linalg.norm(sample_data - sample_data[i], axis=1)
+            # Trier et prendre les k plus proches (exclure le point lui-même)
+            sorted_distances = np.sort(point_distances)[1:k+1]
+            distances.extend(sorted_distances.tolist())
+        
+        if not distances:
+            return 1.0
+        
+        # Utiliser la médiane pour être robuste aux outliers
+        auto_distance = float(np.median(distances))
+        
+        # Ajuster basé sur la densité
+        avg_distance = float(np.mean(distances))
+        density_factor = avg_distance / auto_distance
+        
+        # Formule basée sur l'article (adaptée)
+        optimal_distance = auto_distance * (1 + 0.1 * np.log1p(density_factor))
+        
+        return round(optimal_distance, 3)
+    
+    @staticmethod
+    def cluster_by_distance(data: np.ndarray, seed_indices: List[int], 
+                          min_distance: float, feature_names: List[str]) -> Dict[str, Any]:
+        """
+        Effectue le clustering basé sur la distance
+        
+        Args:
+            data: Données standardisées
+            seed_indices: Indices des points sélectionnés comme graines
+            min_distance: Distance minimale pour regrouper
+            feature_names: Noms des features
+        
+        Returns:
+            Dictionnaire avec les clusters et statistiques
+        """
+        n_samples = len(data)
+        
+        if not seed_indices:
+            raise ValueError("Au moins un point de graine est requis")
+        
+        # Initialiser les clusters avec les graines
+        clusters = []
+        labels = -np.ones(n_samples, dtype=int)
+        
+        # Chaque graine forme son propre cluster initial
+        for i, seed_idx in enumerate(seed_indices):
+            if labels[seed_idx] == -1:  # Pas encore assigné
+                clusters.append({
+                    'id': i,
+                    'seed_index': seed_idx,
+                    'indices': [seed_idx],
+                    'centroid': data[seed_idx].tolist()
+                })
+                labels[seed_idx] = i
+        
+        # Assigner les autres points
+        for point_idx in range(n_samples):
+            if labels[point_idx] != -1:
+                continue  # Déjà assigné
+            
+            point = data[point_idx]
+            min_dist = float('inf')
+            closest_cluster = -1
+            
+            # Trouver le cluster le plus proche
+            for cluster in clusters:
+                centroid = np.array(cluster['centroid'])
+                dist = np.linalg.norm(point - centroid)
+                
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_cluster = cluster['id']
+            
+            # Vérifier la distance minimale
+            if min_dist <= min_distance:
+                # Assigner au cluster
+                labels[point_idx] = closest_cluster
+                clusters[closest_cluster]['indices'].append(point_idx)
+                
+                # Mettre à jour le centroïde
+                cluster_indices = clusters[closest_cluster]['indices']
+                new_centroid = np.mean(data[cluster_indices], axis=0)
+                clusters[closest_cluster]['centroid'] = new_centroid.tolist()
+            else:
+                # Créer un nouveau cluster avec ce point
+                new_id = len(clusters)
+                clusters.append({
+                    'id': new_id,
+                    'seed_index': point_idx,
+                    'indices': [point_idx],
+                    'centroid': point.tolist()
+                })
+                labels[point_idx] = new_id
+        
+        # Calculer les statistiques
+        stats = {
+            'n_clusters': len(clusters),
+            'n_samples': n_samples,
+            'min_distance': min_distance,
+            'seed_points': seed_indices
+        }
+        
+        # Enrichir les informations des clusters
+        for cluster in clusters:
+            indices = cluster['indices']
+            cluster_data = data[indices]
+            
+            cluster['size'] = len(indices)
+            cluster['percentage'] = (len(indices) / n_samples) * 100
+            
+            # Calculer les stats par feature
+            cluster['features'] = {}
+            for i, feature in enumerate(feature_names):
+                values = cluster_data[:, i]
+                cluster['features'][feature] = {
+                    'mean': float(np.mean(values)),
+                    'std': float(np.std(values)),
+                    'min': float(np.min(values)),
+                    'max': float(np.max(values))
+                }
+            
+            # Points dans l'espace 2D
+            cluster['points_2d'] = data_manager.data_2d[indices].tolist()
+        
+        return {
+            'clusters': clusters,
+            'labels': labels.tolist(),
+            'statistics': stats
+        }
 
 # =====================
 # 🚀 Endpoints API
 # =====================
 
-@app.post("/run_apriori", response_model=AprioriResponse)
-async def run_apriori(params: AprioriParams):
-    """
-    🔬 Exécute l'algorithme Apriori optimisé
-    """
+@app.get("/dataset_info")
+async def get_dataset_info():
+    """📊 Informations sur le dataset"""
     try:
-        logger.info(f"Démarrage Apriori avec params: {params}")
-        
-        data_loader = HeartFailureDataLoader()
-        transactions = data_loader.load_dataset()
-        
-        if not transactions:
-            raise HTTPException(status_code=400, detail="Aucune transaction chargée")
-
-        apriori = Apriori(
-            min_support=params.min_support,
-            min_confidence=params.min_confidence
-        )
-        apriori.fit(transactions)
-        rules = apriori.generate_rules()
-        statistics = apriori.get_statistics()
-
-        rules_native = to_native(rules)
-        statistics_native = to_native(statistics)
-        
-        attributes = sorted({
-            str(item) 
-            for rule in rules_native 
-            for item in rule["antecedent"] + rule["consequent"]
-        })
-
-        response = AprioriResponse(
-            success=True,
-            rules=rules_native,
-            attributes=attributes,
-            statistics=statistics_native,
-            total_rules=len(rules_native),
-            total_transactions=len(transactions),
-            execution_time=statistics_native['execution_time'],
-            matrix_type="Sparse (CSR)" if statistics_native['use_sparse_matrix'] else "Dense (NumPy)"
-        )
-        
-        logger.info(f"Apriori terminé: {len(rules_native)} règles")
-        return response
-
-    except HTTPException:
-        raise
+        return {
+            'success': True,
+            'total_samples': len(data_manager.data),
+            'features': data_manager.feature_names,
+            'feature_stats': {
+                feature: {
+                    'mean': float(data_manager.data[feature].mean()),
+                    'std': float(data_manager.data[feature].std()),
+                    'min': float(data_manager.data[feature].min()),
+                    'max': float(data_manager.data[feature].max())
+                }
+                for feature in data_manager.feature_names
+            }
+        }
     except Exception as e:
-        logger.error(f"Erreur Apriori: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Erreur interne: {str(e)}")
+        logger.error(f"Erreur dataset info: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/run_kmeans", response_model=KMeansResponse)
-async def run_kmeans(params: KMeansParams):
-    """
-    🎯 Exécute l'algorithme K-Means sur les données numériques
-    """
+@app.get("/get_data_points")
+async def get_data_points():
+    """📈 Récupère les points de données pour visualisation"""
     try:
-        logger.info(f"Démarrage K-Means avec params: {params}")
+        points_2d = data_manager.data_2d.tolist()
+        points_3d = data_manager.data_3d.tolist()
+        scaled_data = data_manager.scaled_data.tolist()
         
-        # Chargement et préparation des données
-        data_loader = HeartFailureDataLoader()
-        df = data_loader.get_dataframe()
+        return {
+            'success': True,
+            'points_2d': points_2d,
+            'points_3d': points_3d,
+            'scaled_data': scaled_data,
+            'feature_names': data_manager.feature_names,
+            'n_samples': len(points_2d)
+        }
+    except Exception as e:
+        logger.error(f"Erreur get_data_points: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/calculate_auto_distance")
+async def calculate_auto_distance():
+    """🤖 Calcule la distance minimale automatique"""
+    try:
+        auto_distance = DistanceBasedClustering.calculate_auto_distance(
+            data_manager.scaled_data
+        )
         
-        if df is None or df.empty:
-            raise HTTPException(status_code=400, detail="Dataset vide")
+        return {
+            'success': True,
+            'auto_distance': auto_distance,
+            'message': f"Distance automatique calculée: {auto_distance}"
+        }
+    except Exception as e:
+        logger.error(f"Erreur calculate_auto_distance: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/interactive_clustering")
+async def interactive_clustering(params: InteractiveClusteringParams):
+    """🎯 Clustering interactif basé sur la distance"""
+    try:
+        logger.info(f"Clustering interactif: {params.selected_points} points, distance={params.min_distance}")
         
-        # Sélection des colonnes numériques
-        numerical_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if not numerical_cols:
-            raise HTTPException(status_code=400, detail="Aucune colonne numérique trouvée")
+        # Utiliser la distance automatique si demandé
+        if params.auto_distance:
+            auto_dist = DistanceBasedClustering.calculate_auto_distance(
+                data_manager.scaled_data
+            )
+            min_distance = auto_dist
+        else:
+            min_distance = params.min_distance
         
-        X = df[numerical_cols].values
+        # Effectuer le clustering
+        result = DistanceBasedClustering.cluster_by_distance(
+            data=data_manager.scaled_data,
+            seed_indices=params.selected_points,
+            min_distance=min_distance,
+            feature_names=data_manager.feature_names
+        )
         
-        # Normalisation des données
-        X_normalized = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
+        # Ajouter les points 2D pour chaque point
+        result['points_2d'] = data_manager.data_2d.tolist()
         
-        # Exécution K-Means
+        return {
+            'success': True,
+            'clustering_result': result,
+            'used_distance': min_distance,
+            'auto_calculated': params.auto_distance
+        }
+    except Exception as e:
+        logger.error(f"Erreur interactive_clustering: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/initialize_kmeans_from_clusters")
+async def initialize_kmeans_from_clusters(params: KMeansInitParams):
+    """🚀 Initialise K-Means avec des clusters existants"""
+    try:
+        from core.kmeans import KMeans
+        
+        # Vérifier les centroïdes initiaux
+        if not params.initial_centroids:
+            raise ValueError("Centroïdes initiaux requis")
+        
+        # Vérifier la cohérence des dimensions
+        n_features = len(data_manager.scaled_data[0])
+        for centroid in params.initial_centroids:
+            if len(centroid) != n_features:
+                raise ValueError(f"Centroïde de dimension {len(centroid)}, attendu {n_features}")
+        
+        # Exécuter K-Means avec les centroïdes initiaux
         kmeans = KMeans(
             n_clusters=params.n_clusters,
-            max_iterations=params.max_iterations,
-            random_state=params.random_state
+            max_iterations=100,
+            random_state=42
         )
-        kmeans.fit(X_normalized)
         
-        # Calcul du score de silhouette
-        silhouette = kmeans.calculate_silhouette_score(X_normalized)
+        # Utiliser une méthode modifiée pour accepter des centroïdes initiaux
+        # (Vous devrez modifier votre classe KMeans pour accepter ce paramètre)
+        kmeans.centroids = np.array(params.initial_centroids)
+        kmeans.fit(data_manager.scaled_data)
         
+        # Calculer le score de silhouette
+        silhouette = kmeans.calculate_silhouette_score(data_manager.scaled_data)
         statistics = kmeans.get_statistics()
         
-        # Enrichissement des statistiques de cluster
+        # Formater les résultats
         clusters_info = []
         for i in range(params.n_clusters):
             cluster_mask = kmeans.labels == i
-            cluster_data = df[cluster_mask]
+            cluster_data = data_manager.scaled_data[cluster_mask]
             
             clusters_info.append({
                 'cluster_id': i,
-                'size': int(statistics['cluster_stats'][i]['size']),
-                'percentage': float(statistics['cluster_stats'][i]['percentage']),
-                'centroid': statistics['cluster_stats'][i]['centroid'],
+                'size': int(np.sum(cluster_mask)),
+                'percentage': float(np.sum(cluster_mask) / len(data_manager.scaled_data) * 100),
+                'centroid': kmeans.centroids[i].tolist(),
                 'features': {
-                    col: {
-                        'mean': float(cluster_data[col].mean()),
-                        'std': float(cluster_data[col].std()),
-                        'min': float(cluster_data[col].min()),
-                        'max': float(cluster_data[col].max())
+                    feature: {
+                        'mean': float(data_manager.data[feature].iloc[cluster_mask].mean()),
+                        'std': float(data_manager.data[feature].iloc[cluster_mask].std()),
+                        'min': float(data_manager.data[feature].iloc[cluster_mask].min()),
+                        'max': float(data_manager.data[feature].iloc[cluster_mask].max())
                     }
-                    for col in numerical_cols
+                    for feature in data_manager.feature_names
                 }
             })
         
-        response = KMeansResponse(
-            success=True,
-            clusters=clusters_info,
-            statistics=to_native(statistics),
-            labels=to_native(kmeans.labels),
-            centroids=to_native(kmeans.centroids),
-            silhouette_score=float(silhouette),
-            execution_time=float(statistics['execution_time'])
-        )
+        return {
+            'success': True,
+            'clusters': clusters_info,
+            'statistics': {
+                'n_clusters': int(params.n_clusters),
+                'n_iterations': int(statistics['n_iterations']),
+                'execution_time': float(statistics['execution_time']),
+                'inertia': float(statistics['inertia']),
+                'silhouette_score': float(silhouette),
+                'converged': bool(statistics['converged'])
+            },
+            'labels': kmeans.labels.tolist(),
+            'centroids': kmeans.centroids.tolist(),
+            'message': f"K-Means initialisé avec {params.n_clusters} clusters"
+        }
         
-        logger.info(f"K-Means terminé: {params.n_clusters} clusters, silhouette={silhouette:.3f}")
-        return response
-
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Erreur K-Means: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Erreur interne: {str(e)}")
+        logger.error(f"Erreur initialize_kmeans_from_clusters: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/dataset_info", response_model=DatasetInfoResponse)
-async def get_dataset_info():
-    """
-    📊 Informations détaillées sur le dataset
-    """
-    try:
-        data_loader = HeartFailureDataLoader()
-        transactions = data_loader.load_dataset()
-        df = data_loader.get_dataframe()
-        
-        if not transactions:
-            raise HTTPException(status_code=400, detail="Dataset vide")
-        
-        # Analyse des items
-        all_items = [item for t in transactions for item in t]
-        item_counts = Counter(all_items)
-        
-        categories: Dict[str, int] = defaultdict(int)
-        for item in item_counts.keys():
-            category = item.split('_')[0] if '_' in item else "other"
-            categories[category] += 1
-        
-        transaction_lengths = [len(t) for t in transactions]
-        avg_len = np.mean(transaction_lengths)
-        
-        # Statistiques numériques si disponibles
-        numerical_stats = None
-        if df is not None:
-            numerical_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            if numerical_cols:
-                numerical_stats = {
-                    col: {
-                        'mean': float(df[col].mean()),
-                        'std': float(df[col].std()),
-                        'min': float(df[col].min()),
-                        'max': float(df[col].max())
-                    }
-                    for col in numerical_cols
-                }
-        
-        response = DatasetInfoResponse(
-            total_transactions=len(transactions),
-            total_unique_items=len(item_counts),
-            avg_transaction_length=float(avg_len),
-            top_items=[
-                {
-                    "item": item,
-                    "count": int(count),
-                    "percentage": round(float(count) / len(transactions) * 100, 2)
-                }
-                for item, count in item_counts.most_common(15)
-            ],
-            categories={k: int(v) for k, v in dict(categories).items()},
-            numerical_stats=numerical_stats
-        )
-        
-        return response
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur dataset info: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Erreur interne: {str(e)}")
-
-
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 async def health_check():
     """🩺 Vérification de la santé du service"""
-    return HealthResponse(status="healthy", service="CardioAI API", version="2.2")
-
-
-@app.get("/")
-async def root():
-    """📌 Point d'entrée principal"""
     return {
-        "service": "CardioAI API",
-        "version": "2.2",
-        "description": "API d'analyse de données cardiaques",
-        "endpoints": {
-            "POST /run_apriori": "Algorithme Apriori",
-            "POST /run_kmeans": "Algorithme K-Means",
-            "GET /dataset_info": "Informations dataset",
-            "GET /health": "Santé du service",
-            "GET /docs": "Documentation Swagger"
-        },
-        "algorithms": ["Apriori", "K-Means"]
+        'status': 'healthy',
+        'service': 'CardioAI Interactive Clustering API',
+        'version': '2.3',
+        'dataset_loaded': data_manager.data is not None,
+        'n_samples': len(data_manager.data) if data_manager.data else 0
     }
-
 
 if __name__ == "__main__":
     import uvicorn
